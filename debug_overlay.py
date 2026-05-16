@@ -1,83 +1,79 @@
 #!/usr/bin/env python3
 """
-BG Overlay — Step-by-step debug tool
-Run this while Hearthstone is open (fullscreen or windowed).
+BG Overlay — Level Escalation Test
+Cycles through progressively higher window levels every 4 seconds.
+Run this WHILE HEARTHSTONE IS OPEN IN FULLSCREEN and watch carefully.
+
+For each level you'll see the bar colour and the level number change.
+When the red bar SUDDENLY appears in front of Hearthstone, that level wins.
+The first 30 lines of output also probe macOS for the actual shield-level value.
 
   python debug_overlay.py
-
-It runs 4 self-contained tests and prints a PASS/FAIL result for each.
-Copy the entire output and share it so the bug can be pinpointed.
 """
-import sys, os, subprocess, time, ctypes
+import sys, ctypes, ctypes.util, platform
 
-SEP = "─" * 60
-
-
-def header(title):
-    print(f"\n{SEP}\n  {title}\n{SEP}")
-
-
-# ── Test 1: basic Python / platform info ─────────────────────────────────────
-header("TEST 1 — Environment")
-print(f"  Python      : {sys.version}")
-print(f"  Platform    : {sys.platform}")
-import platform
-print(f"  macOS ver   : {platform.mac_ver()[0]}")
+print("─" * 64)
+print(f"  Python : {sys.version.split()[0]}")
+print(f"  macOS  : {platform.mac_ver()[0]}")
+print("─" * 64)
 
 try:
-    import PyQt6.QtCore as _q
-    print(f"  PyQt6       : {_q.PYQT_VERSION_STR}  Qt {_q.QT_VERSION_STR}")
+    cg = ctypes.CDLL(ctypes.util.find_library("CoreGraphics") or
+                     "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
+    cg.CGShieldingWindowLevel.restype = ctypes.c_int32
+    shield = cg.CGShieldingWindowLevel()
+    print(f"  CGShieldingWindowLevel = {shield}")
 except Exception as e:
-    print(f"  PyQt6       : MISSING — {e}")
-    print("  Install:    pip install PyQt6")
-    sys.exit(1)
+    shield = 2147483630
+    print(f"  CGShieldingWindowLevel unavailable ({e}); fallback = {shield}")
 
+# Sequence of levels to test, lowest → highest
+LEVELS = [
+    (25,         "NSStatusWindowLevel"),
+    (1000,       "NSScreenSaverWindowLevel"),
+    (100000,     "Custom high"),
+    (shield - 1, "CGShieldingWindowLevel - 1  ← HIGHEST available"),
+    (shield,     "CGShieldingWindowLevel"),
+]
 
-# ── Test 2: NSWindow setup via libobjc ───────────────────────────────────────
-header("TEST 2 — libobjc / NSWindow level")
-
-def test_libobjc():
-    try:
-        lib = ctypes.CDLL("/usr/lib/libobjc.A.dylib")
-        lib.sel_registerName.restype  = ctypes.c_void_p
-        lib.sel_registerName.argtypes = [ctypes.c_char_p]
-        print("  libobjc.A.dylib  : LOADED ✓")
-        # Verify sel_registerName works
-        sel = lib.sel_registerName(b"window")
-        print(f"  sel 'window'     : 0x{sel:x}  ({'OK' if sel else 'NULL — BAD'})")
-        return True
-    except Exception as e:
-        print(f"  libobjc          : FAILED — {e}")
-        return False
-
-test_libobjc()
-
-
-# ── Test 3: mss screen size ──────────────────────────────────────────────────
-header("TEST 3 — Screen detection (mss)")
-try:
-    import mss
-    with mss.mss() as sct:
-        m = sct.monitors[1]
-        print(f"  Primary screen   : {m['width']}×{m['height']} at ({m['left']},{m['top']})")
-        print(f"  All monitors     : {len(sct.monitors)-1}")
-    print("  mss              : OK ✓")
-except Exception as e:
-    print(f"  mss              : FAILED — {e}")
-    print("  Install:    pip install mss")
-
-
-# ── Test 4: visible overlay window ───────────────────────────────────────────
-header("TEST 4 — PyQt6 overlay window (10-second visual test)")
-print("  A BRIGHT RED WINDOW should appear on your screen.")
-print("  If you see it: the Qt window layer works.")
-print("  If you do NOT see it: the window is hidden behind the game.\n")
+print(f"\nWill test {len(LEVELS)} levels, 4 seconds each.")
+print("Watch the screen — when the red bar appears in front of Hearthstone,")
+print("read the level number on the bar and report it back.\n")
 
 from PyQt6.QtWidgets import QApplication, QWidget
-from PyQt6.QtCore    import Qt, QTimer, QRectF
+from PyQt6.QtCore    import Qt, QTimer
 from PyQt6.QtGui     import QPainter, QColor, QFont
 
-class TestWindow(QWidget):
+libobjc = ctypes.CDLL("/usr/lib/libobjc.A.dylib")
+libobjc.sel_registerName.restype  = ctypes.c_void_p
+libobjc.sel_registerName.argtypes = [ctypes.c_char_p]
+def SEL(n): return libobjc.sel_registerName(n.encode())
+
+def set_level(win, level: int):
+    """Set NSWindow level + correct collection behaviour + click-through."""
+    libobjc.objc_msgSend.restype  = ctypes.c_void_p
+    libobjc.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    ns_window = libobjc.objc_msgSend(int(win.winId()), SEL("window"))
+    if not ns_window:
+        return False
+
+    libobjc.objc_msgSend.restype  = None
+    libobjc.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_long]
+    libobjc.objc_msgSend(ns_window, SEL("setLevel:"), level)
+
+    libobjc.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong]
+    libobjc.objc_msgSend(ns_window, SEL("setCollectionBehavior:"),
+                         (1 << 0) | (1 << 8))   # CanJoinAllSpaces | FullScreenAuxiliary
+
+    libobjc.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_bool]
+    libobjc.objc_msgSend(ns_window, SEL("setIgnoresMouseEvents:"), True)
+
+    libobjc.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    libobjc.objc_msgSend(ns_window, SEL("orderFrontRegardless"))
+    return True
+
+
+class TestBar(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowFlags(
@@ -86,117 +82,51 @@ class TestWindow(QWidget):
             | Qt.WindowType.Tool
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self._countdown = 10
+        self._level = 0
+        self._label = "(starting…)"
 
     def paintEvent(self, _):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-
-        # Bright semi-transparent red background so it's unmissable
-        p.setBrush(QColor(220, 30, 30, 200))
-        p.setPen(Qt.PenStyle.NoPen)
-        p.drawRoundedRect(QRectF(20, 20, self.width()-40, self.height()-40), 20, 20)
-
-        p.setFont(QFont("Arial", 28, QFont.Weight.Bold))
+        # Vivid red bar across the screen
+        p.fillRect(self.rect(), QColor(220, 30, 30, 230))
+        p.setFont(QFont("Arial", 30, QFont.Weight.Bold))
         p.setPen(QColor(255, 255, 255))
         p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter,
-                   f"BG OVERLAY TEST\n"
-                   f"Can you see this?\n"
-                   f"Closing in {self._countdown}s")
+                   f"LEVEL = {self._level}\n{self._label}\nIf you see this → THIS LEVEL WORKS")
         p.end()
 
-    def tick(self):
-        self._countdown -= 1
-        self.update()
-        if self._countdown <= 0:
-            self._apply_nswindow_level()
-            QTimer.singleShot(3000, app.quit)
-
-    def _apply_nswindow_level(self):
-        """Apply NSWindow level after the initial window is visible."""
-        try:
-            lib = ctypes.CDLL("/usr/lib/libobjc.A.dylib")
-            lib.sel_registerName.restype  = ctypes.c_void_p
-            lib.sel_registerName.argtypes = [ctypes.c_char_p]
-
-            def SEL(n): return lib.sel_registerName(n.encode())
-
-            lib.objc_msgSend.restype  = ctypes.c_void_p
-            lib.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-            ns_window = lib.objc_msgSend(int(self.winId()), SEL("window"))
-            print(f"\n  winId()          : 0x{int(self.winId()):x}")
-            print(f"  NSWindow ptr     : {'0x{:x}'.format(ns_window) if ns_window else 'NULL ← BAD'}")
-
-            if not ns_window:
-                print("  NSWindow         : FAILED — window handle is NULL")
-                return
-
-            # Query current level before changing
-            lib.objc_msgSend.restype  = ctypes.c_long
-            lib.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-            current_level = lib.objc_msgSend(ns_window, SEL("level"))
-            print(f"  Current level    : {current_level}")
-
-            # Set to NSScreenSaverWindowLevel = 1000 (above game windows)
-            lib.objc_msgSend.restype  = None
-            lib.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_long]
-            lib.objc_msgSend(ns_window, SEL("setLevel:"), 1000)
-
-            # Verify level was set
-            lib.objc_msgSend.restype  = ctypes.c_long
-            lib.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-            new_level = lib.objc_msgSend(ns_window, SEL("level"))
-            print(f"  Level after set  : {new_level}  ({'OK ✓' if new_level == 1000 else 'UNCHANGED ← BAD'})")
-
-            # Set collection behavior — correct Apple constants from NSWindow.h:
-            #   NSWindowCollectionBehaviorCanJoinAllSpaces    = 1 << 0 = 1
-            #   NSWindowCollectionBehaviorFullScreenAuxiliary = 1 << 8 = 256
-            lib.objc_msgSend.restype  = None
-            lib.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong]
-            behavior = (1 << 0) | (1 << 8)   # = 257
-            lib.objc_msgSend(ns_window, SEL("setCollectionBehavior:"), behavior)
-            print(f"  CollectionBehav  : {behavior} (CanJoinAllSpaces|FullScreenAuxiliary) ✓")
-
-            # Click-through
-            lib.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_bool]
-            lib.objc_msgSend(ns_window, SEL("setIgnoresMouseEvents:"), True)
-            print("  IgnoresMouse     : set ✓")
-
-            # Force to front of level 1000 — without this the level change
-            # can be ignored until the next compositor frame
-            lib.objc_msgSend.restype  = None
-            lib.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-            lib.objc_msgSend(ns_window, SEL("orderFrontRegardless"))
-            print("  orderFront       : called ✓")
-
-        except Exception as e:
-            print(f"  NSWindow setup   : EXCEPTION — {e}")
 
 app = QApplication(sys.argv)
-try:
-    import mss
-    with mss.mss() as sct:
-        m = sct.monitors[1]
-        sw, sh = m["width"], m["height"]
-except Exception:
-    screen = app.primaryScreen()
-    g = screen.geometry()
-    sw, sh = g.width(), g.height()
+screen = app.primaryScreen().geometry()
+sw, sh = screen.width(), screen.height()
 
-win = TestWindow()
-win.setGeometry(sw//4, sh//4, sw//2, sh//2)   # centre of screen
-win.show()
-win.raise_()
+bar = TestBar()
+# Wide bar across centre of screen — easy to spot
+bar.setGeometry(0, sh//2 - 80, sw, 160)
+bar.show()
+bar.raise_()
 
-# Apply NSWindow level after 500ms (window must be shown first)
-QTimer.singleShot(500, win._apply_nswindow_level)
+# Cycle through every level
+state = {"i": 0}
+def next_level():
+    if state["i"] >= len(LEVELS):
+        print("\nAll levels tested.")
+        print("→ Report back the HIGHEST level number you saw on the red bar")
+        print("  (i.e. the last one that appeared in front of Hearthstone).")
+        app.quit()
+        return
+    lvl, label = LEVELS[state["i"]]
+    bar._level = lvl
+    bar._label = label
+    bar.update()
+    ok = set_level(bar, lvl)
+    print(f"  [t={state['i']*4:>2}s]  level={lvl:>12}  {label}  setup={'✓' if ok else '✗'}")
+    state["i"] += 1
 
+next_level()
 timer = QTimer()
-timer.timeout.connect(win.tick)
-timer.start(1000)
+timer.timeout.connect(next_level)
+timer.start(4000)
 
-print(f"  Window size      : {sw//2}×{sh//2} centred on {sw}×{sh} screen")
-print("  Waiting 10 seconds …")
 app.exec()
-
-header("SUMMARY — paste everything above this line in your bug report")

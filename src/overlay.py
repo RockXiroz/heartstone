@@ -50,18 +50,38 @@ def _apply_platform_flags(window: QMainWindow):
         _macos_setup(window)
 
 
+def _macos_get_max_level() -> int:
+    """
+    Return the highest window level available to a regular app.
+    On macOS 26+, fullscreen Metal games run above NSScreenSaverWindowLevel,
+    so we use CGShieldingWindowLevel - 1 (one below the security shield).
+    """
+    import ctypes, ctypes.util
+    try:
+        path = ctypes.util.find_library("CoreGraphics") or \
+               "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics"
+        cg = ctypes.CDLL(path)
+        cg.CGShieldingWindowLevel.restype  = ctypes.c_int32
+        cg.CGShieldingWindowLevel.argtypes = []
+        return cg.CGShieldingWindowLevel() - 1
+    except Exception:
+        # Hardcoded fallback — typical shield level minus 1
+        return 2147483629
+
+
 def _macos_setup(window: QMainWindow):
     """
     Configure the NSWindow using libobjc via ctypes — zero external dependencies.
 
-    Correct Apple constants (from NSWindow.h):
-      NSScreenSaverWindowLevel                     = 1000
+    Apple constants from NSWindow.h:
       NSWindowCollectionBehaviorCanJoinAllSpaces    = 1 << 0  (= 1)
       NSWindowCollectionBehaviorFullScreenAuxiliary = 1 << 8  (= 256)
 
-    Previous code had the wrong bit positions (1<<2 and 1<<7), which set
-    Managed + FullScreenPrimary instead — actively preventing the overlay
-    from appearing in Hearthstone's fullscreen Space.
+    Level strategy:
+      Use CGShieldingWindowLevel - 1.  This is the highest level a regular
+      app can use (one below the screen-saver/login shield).  macOS 26 runs
+      fullscreen games above the conventional NSScreenSaverWindowLevel
+      (1000), so anything lower is hidden.
     """
     import ctypes
 
@@ -77,6 +97,8 @@ def _macos_setup(window: QMainWindow):
     def _SEL(name: str):
         return libobjc.sel_registerName(name.encode())
 
+    target_level = _macos_get_max_level()
+
     try:
         # ── Step 1: NSView* → NSWindow* ──────────────────────────────────
         libobjc.objc_msgSend.restype  = ctypes.c_void_p
@@ -87,18 +109,13 @@ def _macos_setup(window: QMainWindow):
             log.warning("macOS: NSWindow not ready yet — platform flags will retry")
             return
 
-        # ── Step 2: NSScreenSaverWindowLevel (1000) ───────────────────────
-        # Level 25 (NSStatusWindowLevel) is below Hearthstone's fullscreen
-        # window level on macOS 26.  1000 sits above all game windows.
+        # ── Step 2: CGShieldingWindowLevel - 1 ────────────────────────────
         libobjc.objc_msgSend.restype  = None
         libobjc.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
                                          ctypes.c_long]
-        libobjc.objc_msgSend(ns_window, _SEL("setLevel:"), 1000)
+        libobjc.objc_msgSend(ns_window, _SEL("setLevel:"), target_level)
 
         # ── Step 3: CanJoinAllSpaces | FullScreenAuxiliary ────────────────
-        # Correct bit positions from NSWindow.h:
-        #   CanJoinAllSpaces    = 1 << 0 = 1
-        #   FullScreenAuxiliary = 1 << 8 = 256
         libobjc.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
                                          ctypes.c_ulong]
         libobjc.objc_msgSend(ns_window, _SEL("setCollectionBehavior:"),
@@ -114,7 +131,8 @@ def _macos_setup(window: QMainWindow):
         libobjc.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
         libobjc.objc_msgSend(ns_window, _SEL("orderFrontRegardless"))
 
-        log.info("macOS overlay: level=1000, behavior=257 (CanJoinAllSpaces|FullScreenAuxiliary), click-through ✓")
+        log.info("macOS overlay: level=%d (CGShieldingWindowLevel-1), behavior=257, click-through ✓",
+                 target_level)
 
     except Exception as exc:
         log.warning("macOS NSWindow setup failed: %s", exc)
