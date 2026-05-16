@@ -32,7 +32,9 @@ log = logging.getLogger(__name__)
 # ── OS helpers ────────────────────────────────────────────────────────────────
 
 def _apply_platform_flags(window: QMainWindow):
-    """Make the overlay click-through and float above everything."""
+    """Make the overlay click-through and float above everything.
+    Must be called AFTER the native window handle exists (i.e. after show()).
+    """
     if sys.platform == "win32":
         try:
             import ctypes
@@ -45,29 +47,56 @@ def _apply_platform_flags(window: QMainWindow):
             log.warning("Win32 click-through failed: %s", e)
 
     elif sys.platform == "darwin":
-        _macos_float_level(window)
+        _macos_setup(window)
 
 
-def _macos_float_level(window: QMainWindow):
+def _macos_setup(window: QMainWindow):
     """
-    Raise the NSWindow to NSStatusWindowLevel (25) so it appears above
-    full-screen Metal apps.  Requires pyobjc-framework-AppKit.
+    1. winId() returns an NSView*.  We must call .window() to get the NSWindow.
+    2. Set NSStatusWindowLevel (25) so we float above the game even when it
+       runs fullscreen.
+    3. NSWindowCollectionBehaviorCanJoinAllSpaces makes us appear in every
+       Mission Control Space, including Hearthstone's fullscreen Space.
+    4. setIgnoresMouseEvents_(True) is the correct macOS click-through API.
+
+    Requires:  pip install pyobjc-framework-AppKit
     """
     try:
-        import objc                          # type: ignore[import]
-        from AppKit import NSApp             # type: ignore[import]
-        # NSStatusWindowLevel = 25
-        NSStatusWindowLevel = 25
-        ptr = int(window.winId())
-        ns_win = objc.objc_object(c_void_p=ptr)
-        ns_win.setLevel_(NSStatusWindowLevel)
-        ns_win.setCollectionBehavior_(
-            1 << 2 |   # NSWindowCollectionBehaviorCanJoinAllSpaces
-            1 << 7     # NSWindowCollectionBehaviorFullScreenAuxiliary
+        import objc                                       # type: ignore[import]
+        from AppKit import (                              # type: ignore[import]
+            NSWindowCollectionBehaviorCanJoinAllSpaces,
+            NSWindowCollectionBehaviorFullScreenAuxiliary,
         )
-        log.debug("macOS NSWindow level set to NSStatusWindowLevel")
+
+        # winId() is an NSView pointer — .window() gives us the NSWindow
+        ns_view   = objc.objc_object(c_void_p=int(window.winId()))
+        ns_window = ns_view.window()
+
+        if ns_window is None:
+            log.warning("macOS: NSWindow is None — window not fully shown yet")
+            return
+
+        # Float above the game (NSStatusWindowLevel = 25)
+        ns_window.setLevel_(25)
+
+        # Join ALL spaces so we're visible in Hearthstone's fullscreen Space
+        ns_window.setCollectionBehavior_(
+            NSWindowCollectionBehaviorCanJoinAllSpaces
+            | NSWindowCollectionBehaviorFullScreenAuxiliary
+        )
+
+        # True click-through: mouse events fall through to whatever is below
+        ns_window.setIgnoresMouseEvents_(True)
+
+        log.info("macOS overlay: level=25, joins all spaces, ignores mouse events")
+
+    except ImportError:
+        log.warning(
+            "pyobjc-framework-AppKit not installed — overlay may be hidden behind "
+            "the game on macOS.\n  Fix:  pip install pyobjc-framework-AppKit"
+        )
     except Exception as e:
-        log.debug("pyobjc not available, skipping NSWindow level: %s", e)
+        log.warning("macOS NSWindow setup failed: %s", e)
 
 
 # ── Canvas ────────────────────────────────────────────────────────────────────
@@ -261,9 +290,10 @@ class OverlayWindow(QMainWindow):
         self.setGeometry(x, y, w, h)
         self.show()
         self.raise_()
-        self.activateWindow()
-        _apply_platform_flags(self)
-        log.info("Overlay visible at %d,%d  %dx%d", x, y, w, h)
+        # Delay flag application: the native NSWindow handle is only guaranteed
+        # to exist after the event loop has processed the show() event.
+        QTimer.singleShot(200, lambda: _apply_platform_flags(self))
+        log.info("Overlay shown at %d,%d  %dx%d", x, y, w, h)
 
     # ── Thread-safe refresh ───────────────────────────────────────────────
 

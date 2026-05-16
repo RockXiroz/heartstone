@@ -38,10 +38,20 @@ RE_BLOCK_START  = re.compile(
     r"BLOCK_START BlockType=(?P<type>\S+).*?Entity=(?P<entity>.+?) ")
 RE_BLOCK_END    = re.compile(r"BLOCK_END")
 
-# BG shopping phase trigger card
-SHOP_TRIGGER    = "TB_BaconShop_SetAside_enchantment"
-COMBAT_TRIGGER  = "TB_BaconShop_8p_Phase_Main"
-BOB_NAME        = "TB_BaconShopBob"
+# BG phase triggers — Blizzard has renamed these across patches, so we match
+# any known variant.  A line must also contain "BLOCK_START" to qualify.
+SHOP_TRIGGERS = [
+    "TB_BaconShop_SetAside_enchantment",   # original
+    "TB_BaconShop_SetAside",               # abbreviated form seen in some logs
+    "TB_BaconShopPhase",                   # newer patch variant
+    "BaconShop_SetAside",                  # another abbreviation
+]
+COMBAT_TRIGGERS = [
+    "TB_BaconShop_8p_Phase_Main",
+    "TB_BaconShop_Combat",
+    "BaconShop_Combat",
+]
+BOB_NAME = "TB_BaconShopBob"
 
 # Zone constants
 ZONE_PLAY     = "PLAY"
@@ -124,20 +134,20 @@ class LogReader:
     def _parse_line(self, line: str):
         changed = False
 
-        # Detect shopping phase
-        if SHOP_TRIGGER in line and "BLOCK_START" in line:
-            if self.state.phase != "SHOPPING":
-                self.state.phase = "SHOPPING"
-                self.state.turn += 1
-                self.state.reset_tavern()
-                log.debug("Phase → SHOPPING (turn %d)", self.state.turn)
-                changed = True
-
-        elif COMBAT_TRIGGER in line and "BLOCK_START" in line:
-            if self.state.phase != "COMBAT":
-                self.state.phase = "COMBAT"
-                log.debug("Phase → COMBAT")
-                changed = True
+        # Detect shopping phase — try all known trigger strings
+        if "BLOCK_START" in line:
+            if any(t in line for t in SHOP_TRIGGERS):
+                if self.state.phase != "SHOPPING":
+                    self.state.phase = "SHOPPING"
+                    self.state.turn += 1
+                    self.state.reset_tavern()
+                    log.debug("Phase → SHOPPING (turn %d)", self.state.turn)
+                    changed = True
+            elif any(t in line for t in COMBAT_TRIGGERS):
+                if self.state.phase != "COMBAT":
+                    self.state.phase = "COMBAT"
+                    log.debug("Phase → COMBAT")
+                    changed = True
 
         # Track entities
         m = RE_FULL_ENTITY.search(line) or RE_SHOW_ENTITY.search(line)
