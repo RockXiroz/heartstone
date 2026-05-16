@@ -53,14 +53,15 @@ def _apply_platform_flags(window: QMainWindow):
 def _macos_setup(window: QMainWindow):
     """
     Configure the NSWindow using libobjc via ctypes — zero external dependencies.
-    libobjc.A.dylib ships with every macOS installation.
 
-    What we do:
-      1. winId() returns NSView* — call .window to get the NSWindow.
-      2. setLevel: 25  (NSStatusWindowLevel) → floats above fullscreen Metal apps.
-      3. setCollectionBehavior: CanJoinAllSpaces | FullScreenAuxiliary
-         → appears in Hearthstone's fullscreen Mission Control Space.
-      4. setIgnoresMouseEvents: YES  → true click-through, no focus stealing.
+    Correct Apple constants (from NSWindow.h):
+      NSScreenSaverWindowLevel                     = 1000
+      NSWindowCollectionBehaviorCanJoinAllSpaces    = 1 << 0  (= 1)
+      NSWindowCollectionBehaviorFullScreenAuxiliary = 1 << 8  (= 256)
+
+    Previous code had the wrong bit positions (1<<2 and 1<<7), which set
+    Managed + FullScreenPrimary instead — actively preventing the overlay
+    from appearing in Hearthstone's fullscreen Space.
     """
     import ctypes
 
@@ -86,24 +87,34 @@ def _macos_setup(window: QMainWindow):
             log.warning("macOS: NSWindow not ready yet — platform flags will retry")
             return
 
-        # ── Step 2: setLevel: NSStatusWindowLevel (25) ───────────────────
+        # ── Step 2: NSScreenSaverWindowLevel (1000) ───────────────────────
+        # Level 25 (NSStatusWindowLevel) is below Hearthstone's fullscreen
+        # window level on macOS 26.  1000 sits above all game windows.
         libobjc.objc_msgSend.restype  = None
         libobjc.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
                                          ctypes.c_long]
-        libobjc.objc_msgSend(ns_window, _SEL("setLevel:"), 25)
+        libobjc.objc_msgSend(ns_window, _SEL("setLevel:"), 1000)
 
-        # ── Step 3: setCollectionBehavior: CanJoinAllSpaces|FullScreenAuxiliary
+        # ── Step 3: CanJoinAllSpaces | FullScreenAuxiliary ────────────────
+        # Correct bit positions from NSWindow.h:
+        #   CanJoinAllSpaces    = 1 << 0 = 1
+        #   FullScreenAuxiliary = 1 << 8 = 256
         libobjc.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
                                          ctypes.c_ulong]
         libobjc.objc_msgSend(ns_window, _SEL("setCollectionBehavior:"),
-                             (1 << 2) | (1 << 7))
+                             (1 << 0) | (1 << 8))   # = 257
 
-        # ── Step 4: setIgnoresMouseEvents: YES ───────────────────────────
+        # ── Step 4: click-through ─────────────────────────────────────────
         libobjc.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
                                          ctypes.c_bool]
         libobjc.objc_msgSend(ns_window, _SEL("setIgnoresMouseEvents:"), True)
 
-        log.info("macOS overlay: level=25, joins all spaces, click-through ✓")
+        # ── Step 5: force to front of this level ──────────────────────────
+        libobjc.objc_msgSend.restype  = None
+        libobjc.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        libobjc.objc_msgSend(ns_window, _SEL("orderFrontRegardless"))
+
+        log.info("macOS overlay: level=1000, behavior=257 (CanJoinAllSpaces|FullScreenAuxiliary), click-through ✓")
 
     except Exception as exc:
         log.warning("macOS NSWindow setup failed: %s", exc)

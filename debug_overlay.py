@@ -137,27 +137,37 @@ class TestWindow(QWidget):
             current_level = lib.objc_msgSend(ns_window, SEL("level"))
             print(f"  Current level    : {current_level}")
 
-            # Set to NSStatusWindowLevel = 25
+            # Set to NSScreenSaverWindowLevel = 1000 (above game windows)
             lib.objc_msgSend.restype  = None
             lib.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_long]
-            lib.objc_msgSend(ns_window, SEL("setLevel:"), 25)
+            lib.objc_msgSend(ns_window, SEL("setLevel:"), 1000)
 
             # Verify level was set
             lib.objc_msgSend.restype  = ctypes.c_long
             lib.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
             new_level = lib.objc_msgSend(ns_window, SEL("level"))
-            print(f"  Level after set  : {new_level}  ({'OK ✓' if new_level == 25 else 'UNCHANGED ← BAD'})")
+            print(f"  Level after set  : {new_level}  ({'OK ✓' if new_level == 1000 else 'UNCHANGED ← BAD'})")
 
-            # Set collection behavior
+            # Set collection behavior — correct Apple constants from NSWindow.h:
+            #   NSWindowCollectionBehaviorCanJoinAllSpaces    = 1 << 0 = 1
+            #   NSWindowCollectionBehaviorFullScreenAuxiliary = 1 << 8 = 256
             lib.objc_msgSend.restype  = None
             lib.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong]
-            lib.objc_msgSend(ns_window, SEL("setCollectionBehavior:"), (1 << 2) | (1 << 7))
-            print("  CollectionBehav  : set ✓")
+            behavior = (1 << 0) | (1 << 8)   # = 257
+            lib.objc_msgSend(ns_window, SEL("setCollectionBehavior:"), behavior)
+            print(f"  CollectionBehav  : {behavior} (CanJoinAllSpaces|FullScreenAuxiliary) ✓")
 
             # Click-through
             lib.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_bool]
             lib.objc_msgSend(ns_window, SEL("setIgnoresMouseEvents:"), True)
             print("  IgnoresMouse     : set ✓")
+
+            # Force to front of level 1000 — without this the level change
+            # can be ignored until the next compositor frame
+            lib.objc_msgSend.restype  = None
+            lib.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            lib.objc_msgSend(ns_window, SEL("orderFrontRegardless"))
+            print("  orderFront       : called ✓")
 
         except Exception as e:
             print(f"  NSWindow setup   : EXCEPTION — {e}")
