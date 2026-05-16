@@ -1,26 +1,24 @@
 """
-Transparent PyQt6 overlay window that draws recommendation arrows and an
-info panel on top of the Hearthstone game window.
+Transparent PyQt6 overlay — always-on-top, click-through, thread-safe.
 
-The window is:
-  • Always-on-top
-  • Fully transparent background
-  • Click-through (user input passes through to the game)
+macOS: NSWindowLevel is set to NSStatusWindowLevel so the overlay floats
+       above fullscreen Metal apps (Hearthstone).
+Win32: WS_EX_TRANSPARENT|WS_EX_LAYERED applied for click-through.
 
-On Windows the WS_EX_TRANSPARENT + WS_EX_LAYERED styles are applied.
-On macOS the NSWindow floating level handles it.
+Thread safety: force_refresh() is safe to call from any thread — it posts
+a zero-delay QTimer to the main-thread event loop instead of touching Qt
+objects directly.
 """
 from __future__ import annotations
 
 import sys
-import math
 import logging
-from typing import Optional, List
+from typing import List, Optional
 
-from PyQt6.QtCore import Qt, QTimer, QPointF, QRectF
+from PyQt6.QtCore import Qt, QTimer, QPointF, QRectF, pyqtSlot
 from PyQt6.QtGui import (
-    QPainter, QColor, QPen, QBrush, QFont, QPolygonF,
-    QLinearGradient, QRadialGradient, QPainterPath,
+    QPainter, QColor, QPen, QBrush, QFont,
+    QRadialGradient, QPainterPath,
 )
 from PyQt6.QtWidgets import QApplication, QMainWindow, QWidget
 
@@ -31,8 +29,10 @@ import config
 log = logging.getLogger(__name__)
 
 
-def _make_click_through(window: QMainWindow):
-    """Apply OS-specific click-through so mouse events pass to the game."""
+# ── OS helpers ────────────────────────────────────────────────────────────────
+
+def _apply_platform_flags(window: QMainWindow):
+    """Make the overlay click-through and float above everything."""
     if sys.platform == "win32":
         try:
             import ctypes
@@ -40,194 +40,201 @@ def _make_click_through(window: QMainWindow):
             style = ctypes.windll.user32.GetWindowLongW(hwnd, -20)
             # WS_EX_LAYERED | WS_EX_TRANSPARENT
             ctypes.windll.user32.SetWindowLongW(hwnd, -20, style | 0x80000 | 0x20)
+            log.debug("Win32 click-through applied")
         except Exception as e:
-            log.warning("click-through setup failed: %s", e)
-    # macOS: Qt Tool + TranslucentBackground is sufficient
+            log.warning("Win32 click-through failed: %s", e)
 
+    elif sys.platform == "darwin":
+        _macos_float_level(window)
+
+
+def _macos_float_level(window: QMainWindow):
+    """
+    Raise the NSWindow to NSStatusWindowLevel (25) so it appears above
+    full-screen Metal apps.  Requires pyobjc-framework-AppKit.
+    """
+    try:
+        import objc                          # type: ignore[import]
+        from AppKit import NSApp             # type: ignore[import]
+        # NSStatusWindowLevel = 25
+        NSStatusWindowLevel = 25
+        ptr = int(window.winId())
+        ns_win = objc.objc_object(c_void_p=ptr)
+        ns_win.setLevel_(NSStatusWindowLevel)
+        ns_win.setCollectionBehavior_(
+            1 << 2 |   # NSWindowCollectionBehaviorCanJoinAllSpaces
+            1 << 7     # NSWindowCollectionBehaviorFullScreenAuxiliary
+        )
+        log.debug("macOS NSWindow level set to NSStatusWindowLevel")
+    except Exception as e:
+        log.debug("pyobjc not available, skipping NSWindow level: %s", e)
+
+
+# ── Canvas ────────────────────────────────────────────────────────────────────
 
 class OverlayCanvas(QWidget):
-    """The painting surface that draws arrows and the info panel."""
+    """The paint surface — transparent, mouse-passthrough."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
-        self._recs: List[Recommendation] = []
-        self._show_panel = True
+        self._recs:         List[Recommendation] = []
+        self._tavern_count: int = 0            # total slots for spacing
+        self._phase:        str = "UNKNOWN"
 
-    def update_recommendations(self, recs: List[Recommendation]):
-        self._recs = recs
-        self.update()
+    # Called from main thread only (enforced by OverlayWindow.force_refresh)
+    def set_state(self, recs: List[Recommendation],
+                  tavern_count: int, phase: str):
+        self._recs         = recs
+        self._tavern_count = max(tavern_count, len(recs), 1)
+        self._phase        = phase
+        self.update()                          # triggers paintEvent on main thread
 
     # ── Painting ──────────────────────────────────────────────────────────
     def paintEvent(self, _event):
-        if not self._recs:
-            return
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
 
-        best = self._recs[0]
-        cx, cy = self._card_centre(best.board_index)
+        self._draw_status_badge(p)
 
-        self._draw_glow(p, cx, cy)
-        self._draw_arrow(p, cx, cy)
-        if self._show_panel:
+        if self._recs and self._phase == "SHOPPING":
+            best = self._recs[0]
+            cx, cy = self._card_centre(best.board_index)
+            self._draw_glow(p, cx, cy)
+            self._draw_arrow(p, cx, cy)
             self._draw_panel(p, best, cx, cy)
-
-        # Draw dimmer rank badges for 2nd / 3rd picks
-        for rank, rec in enumerate(self._recs[1:3], start=2):
-            rx, ry = self._card_centre(rec.board_index)
-            self._draw_rank_badge(p, rx, ry, rank)
+            for rank, rec in enumerate(self._recs[1:3], 2):
+                self._draw_rank_badge(p, *self._card_centre(rec.board_index), rank)
 
         p.end()
 
-    # ── Card position helpers ─────────────────────────────────────────────
+    # ── Card positions ────────────────────────────────────────────────────
     def _card_centre(self, slot: int) -> tuple[float, float]:
-        """
-        Return pixel (x, y) for tavern card at `slot` index,
-        relative to this widget's coordinate system.
-        """
-        w = self.width()
-        h = self.height()
-        n = max(len(self._recs), 1)
+        w, h = self.width(), self.height()
+        n    = self._tavern_count             # use TOTAL slots, not len(recs)
+        x0   = config.TAVERN_X_START * w
+        x1   = config.TAVERN_X_END   * w
+        step = (x1 - x0) / max(n - 1, 1) if n > 1 else 0
+        return x0 + slot * step, config.TAVERN_ROW_Y * h
 
-        # Distribute slots evenly across the tavern X range
-        x_start = config.TAVERN_X_START * w
-        x_end   = config.TAVERN_X_END   * w
-        step    = (x_end - x_start) / max(n - 1, 1) if n > 1 else 0
-        x       = x_start + slot * step
-        y       = config.TAVERN_ROW_Y * h
-        return x, y
+    # ── Drawing ───────────────────────────────────────────────────────────
+    def _draw_status_badge(self, p: QPainter):
+        """Small pill in the top-right corner — always visible so user knows
+        the overlay is active."""
+        phase_colors = {
+            "SHOPPING": (QColor(76, 175, 80),  "購物階段"),
+            "COMBAT":   (QColor(244, 67, 54),  "戰鬥階段"),
+            "UNKNOWN":  (QColor(120, 120, 120),"等待遊戲…"),
+        }
+        color, label = phase_colors.get(self._phase,
+                                        (QColor(120, 120, 120), self._phase))
+        pw, ph = 130, 26
+        px = self.width() - pw - 12
+        py = 10
+        p.setPen(QPen(color, 1))
+        p.setBrush(QBrush(QColor(0, 0, 0, 180)))
+        p.drawRoundedRect(QRectF(px, py, pw, ph), 8, 8)
+        p.setPen(color)
+        p.setFont(QFont("Arial", 10, QFont.Weight.Bold))
+        p.drawText(int(px + 8), int(py + 18), label)
 
-    # ── Drawing primitives ────────────────────────────────────────────────
     def _draw_glow(self, p: QPainter, cx: float, cy: float):
-        radius = 70
-        grad = QRadialGradient(QPointF(cx, cy), radius)
-        grad.setColorAt(0.0, QColor(255, 215, 0, 160))
-        grad.setColorAt(0.6, QColor(255, 215, 0, 40))
-        grad.setColorAt(1.0, QColor(255, 215, 0, 0))
-        p.setBrush(QBrush(grad))
+        r = 72
+        g = QRadialGradient(QPointF(cx, cy), r)
+        g.setColorAt(0.0, QColor(255, 215, 0, 170))
+        g.setColorAt(0.6, QColor(255, 215, 0,  45))
+        g.setColorAt(1.0, QColor(255, 215, 0,   0))
         p.setPen(Qt.PenStyle.NoPen)
-        p.drawEllipse(QPointF(cx, cy), radius, radius)
+        p.setBrush(QBrush(g))
+        p.drawEllipse(QPointF(cx, cy), r, r)
 
     def _draw_arrow(self, p: QPainter, cx: float, cy: float):
-        """Draw a downward-pointing arrow above the target card."""
-        tip_y     = cy - 15          # arrowhead tip (near card top)
-        tail_y    = tip_y - 70       # shaft top
-        shaft_w   = 10
-        head_h    = 30
-        head_w    = 34
+        tip_y  = cy - 14
+        tail_y = tip_y - 68
+        sw, hw, hh = 10, 34, 30
 
-        # Shaft
-        shaft_path = QPainterPath()
-        shaft_path.addRect(QRectF(cx - shaft_w/2, tail_y, shaft_w, tip_y - tail_y - head_h))
+        shaft = QPainterPath()
+        shaft.addRect(QRectF(cx - sw/2, tail_y, sw, tip_y - tail_y - hh))
+        head  = QPainterPath()
+        head.moveTo(cx, tip_y)
+        head.lineTo(cx - hw/2, tip_y - hh)
+        head.lineTo(cx + hw/2, tip_y - hh)
+        head.closeSubpath()
+        full = shaft.united(head)
 
-        # Arrowhead triangle
-        head_path = QPainterPath()
-        head_path.moveTo(cx, tip_y)
-        head_path.lineTo(cx - head_w/2, tip_y - head_h)
-        head_path.lineTo(cx + head_w/2, tip_y - head_h)
-        head_path.closeSubpath()
-
-        full = shaft_path.united(head_path)
-
-        # White fill
-        p.setPen(QPen(QColor(0, 0, 0, 180), 2))
-        p.setBrush(QBrush(QColor(255, 255, 255, 230)))
+        p.setPen(QPen(QColor(0, 0, 0, 160), 2))
+        p.setBrush(QBrush(QColor(255, 255, 255, 235)))
         p.drawPath(full)
-
-        # Gold outline
         p.setPen(QPen(QColor(255, 215, 0), 2))
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawPath(full)
 
     def _draw_panel(self, p: QPainter, rec: Recommendation, cx: float, cy: float):
-        """Draw the info panel to the right of the arrow."""
-        pw, ph = 320, 220
+        pw, ph = 320, 224
         margin = 20
-        w = self.width()
+        px = cx + 58 if cx + 58 + pw + margin < self.width() else cx - pw - 58
+        py = max(10, cy - ph // 2)
 
-        # Prefer right side; flip left if near edge
-        px = cx + 55 if cx + 55 + pw + margin < w else cx - pw - 55
-        py = cy - ph // 2
-
-        # Panel background
-        bg = QColor(26, 26, 46, 220)
-        border = QColor(255, 215, 0)
-        p.setPen(QPen(border, 2))
-        p.setBrush(QBrush(bg))
+        p.setPen(QPen(QColor(255, 215, 0), 2))
+        p.setBrush(QBrush(QColor(26, 26, 46, 220)))
         p.drawRoundedRect(QRectF(px, py, pw, ph), 10, 10)
 
-        # Title
         p.setFont(QFont("Arial", 13, QFont.Weight.Bold))
         p.setPen(QColor(255, 215, 0))
-        p.drawText(int(px + 12), int(py + 26), f"▶ {rec.card.name}")
+        name = rec.card.name[:28] + "…" if len(rec.card.name) > 28 else rec.card.name
+        p.drawText(int(px + 12), int(py + 26), f"▶ {name}")
 
-        # Win-rate bar
         wr = rec.win_rate_estimate
         p.setFont(QFont("Arial", 10))
         p.setPen(QColor(200, 200, 200))
         p.drawText(int(px + 12), int(py + 48), f"推薦勝率估計: {wr:.0f}%")
 
-        bar_x, bar_y, bar_w, bar_h = px + 12, py + 54, pw - 24, 10
+        bx, by, bw, bh = px + 12, py + 54, pw - 24, 10
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(QBrush(QColor(60, 60, 80)))
-        p.drawRoundedRect(QRectF(bar_x, bar_y, bar_w, bar_h), 4, 4)
-        fill_w = (wr / 100) * bar_w
+        p.drawRoundedRect(QRectF(bx, by, bw, bh), 4, 4)
         bar_color = (QColor(76, 175, 80) if wr >= 60
                      else QColor(255, 152, 0) if wr >= 50
                      else QColor(244, 67, 54))
         p.setBrush(QBrush(bar_color))
-        p.drawRoundedRect(QRectF(bar_x, bar_y, fill_w, bar_h), 4, 4)
+        p.drawRoundedRect(QRectF(bx, by, (wr / 100) * bw, bh), 4, 4)
 
-        # Score breakdown
         p.setFont(QFont("Arial", 9))
-        p.setPen(QColor(170, 170, 170))
-        breakdown_y = int(py + 80)
-        scores = [
-            ("基礎分",   rec.base),
-            ("種族協同", rec.tribe_bonus),
-            ("套牌完整", rec.comp_bonus),
-            ("成長性",   rec.scaling_bonus),
-            ("剋制對手", rec.counter_bonus),
-        ]
-        for label, val in scores:
-            color = (QColor(76, 175, 80) if val > 0
-                     else QColor(244, 67, 54) if val < 0
-                     else QColor(150, 150, 150))
-            p.setPen(color)
-            sign = "+" if val > 0 else ""
-            p.drawText(int(px + 12), breakdown_y, f"{label}: {sign}{val:.1f}")
-            breakdown_y += 16
+        ty = int(py + 82)
+        for label, val in [("基礎分", rec.base), ("種族協同", rec.tribe_bonus),
+                            ("套牌完整", rec.comp_bonus), ("成長性", rec.scaling_bonus),
+                            ("剋制對手", rec.counter_bonus)]:
+            col = (QColor(76,175,80) if val > 0 else
+                   QColor(244,67,54) if val < 0 else QColor(150,150,150))
+            p.setPen(col)
+            p.drawText(int(px + 12), ty, f"{label}: {'+' if val>0 else ''}{val:.1f}")
+            ty += 16
 
-        # Reasons
-        p.setFont(QFont("Arial", 9))
         p.setPen(QColor(220, 220, 220))
-        reason_y = breakdown_y + 6
+        ry = ty + 6
         for reason in rec.reasons[:3]:
-            # Word-wrap at 44 chars
-            if len(reason) > 44:
-                reason = reason[:42] + "…"
-            p.drawText(int(px + 12), reason_y, f"• {reason}")
-            reason_y += 16
-            if reason_y > py + ph - 12:
+            text = reason[:42] + "…" if len(reason) > 42 else reason
+            p.drawText(int(px + 12), ry, f"• {text}")
+            ry += 16
+            if ry > py + ph - 8:
                 break
 
     def _draw_rank_badge(self, p: QPainter, cx: float, cy: float, rank: int):
-        """Small numbered badge for 2nd/3rd best options."""
-        r = 14
-        alpha = 160 if rank == 2 else 110
+        r, alpha = 14, (160 if rank == 2 else 110)
         p.setPen(QPen(QColor(200, 200, 200, alpha), 1))
         p.setBrush(QBrush(QColor(0, 0, 0, alpha)))
-        p.drawEllipse(QPointF(cx, cy - 28), r, r)
+        p.drawEllipse(QPointF(cx, cy - 30), r, r)
         p.setPen(QColor(255, 255, 255, alpha))
         p.setFont(QFont("Arial", 9, QFont.Weight.Bold))
-        p.drawText(int(cx - 4), int(cy - 28 + 5), str(rank))
+        p.drawText(int(cx - 4), int(cy - 30 + 5), str(rank))
 
+
+# ── Window ────────────────────────────────────────────────────────────────────
 
 class OverlayWindow(QMainWindow):
-    """Top-level always-on-top transparent window."""
+    """Top-level frameless transparent always-on-top window."""
 
     def __init__(self, state: GameState):
         super().__init__()
@@ -245,28 +252,31 @@ class OverlayWindow(QMainWindow):
         self.canvas = OverlayCanvas(self)
         self.setCentralWidget(self.canvas)
 
+        # Periodic refresh from the main thread (backup for when no signal fires)
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._refresh)
         self._timer.start(config.POLL_INTERVAL_MS)
 
-    def show_over_game(self, game_x: int, game_y: int, game_w: int, game_h: int):
-        self.setGeometry(game_x, game_y, game_w, game_h)
+    def show_over_game(self, x: int, y: int, w: int, h: int):
+        self.setGeometry(x, y, w, h)
         self.show()
-        _make_click_through(self)
-        log.info("Overlay shown at %d,%d size %dx%d", game_x, game_y, game_w, game_h)
+        self.raise_()
+        self.activateWindow()
+        _apply_platform_flags(self)
+        log.info("Overlay visible at %d,%d  %dx%d", x, y, w, h)
+
+    # ── Thread-safe refresh ───────────────────────────────────────────────
 
     def force_refresh(self):
-        self._refresh()
+        """Safe to call from any thread — posts refresh to the Qt event loop."""
+        QTimer.singleShot(0, self._refresh)
 
+    @pyqtSlot()
     def _refresh(self):
+        """Always runs on the main thread (called by QTimer)."""
         if self.state.phase != "SHOPPING":
-            self.canvas.update_recommendations([])
+            self.canvas.set_state([], 0, self.state.phase)
             return
 
         recs = self.advisor.recommend()
-        self.canvas.update_recommendations(recs)
-        if recs and config.DEBUG_MODE:
-            log.debug(
-                "Best pick: %s  score=%.2f  wr=%.0f%%",
-                recs[0].card.name, recs[0].total_score, recs[0].win_rate_estimate,
-            )
+        self.canvas.set_state(recs, len(self.state.tavern_cards), self.state.phase)
