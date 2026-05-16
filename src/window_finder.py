@@ -48,30 +48,41 @@ def _find_macos() -> Optional[tuple[int, int, int, int]]:
 
 
 def _quartz_find() -> Optional[tuple[int, int, int, int]]:
-    """Read CGWindowList — requires pyobjc-framework-Quartz."""
+    """
+    Read CGWindowList via ctypes — no pyobjc required.
+    Falls back silently; _screen_size() covers the fullscreen case.
+    """
     try:
-        from Quartz import (            # type: ignore[import]
-            CGWindowListCopyWindowInfo,
-            kCGWindowListOptionOnScreenOnly,
-            kCGNullWindowID,
-        )
-        wins = CGWindowListCopyWindowInfo(
-            kCGWindowListOptionOnScreenOnly, kCGNullWindowID
-        )
-        if not wins:
+        import ctypes, ctypes.util
+        cg = ctypes.CDLL(ctypes.util.find_library("CoreGraphics"))
+
+        # CGWindowListCopyWindowInfo(option, relativeToWindow) -> CFArrayRef
+        cg.CGWindowListCopyWindowInfo.restype  = ctypes.c_void_p
+        cg.CGWindowListCopyWindowInfo.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
+        # kCGWindowListOptionOnScreenOnly = 1, kCGNullWindowID = 0
+        arr = cg.CGWindowListCopyWindowInfo(1, 0)
+        if not arr:
             return None
-        for w in wins:
-            if "Hearthstone" not in (w.get("kCGWindowOwnerName") or ""):
-                continue
-            b = w.get("kCGWindowBounds")
-            if not b:
-                continue
-            x, y, ww, wh = int(b["X"]), int(b["Y"]), int(b["Width"]), int(b["Height"])
-            if ww > 100 and wh > 100:
-                log.info("Quartz: HS window %dx%d at (%d,%d)", ww, wh, x, y)
-                return (x, y, ww, wh)
+
+        # Use PyObjC if present for easy dict iteration; else skip
+        try:
+            import objc                        # type: ignore[import]
+            ns_arr = objc.objc_object(c_void_p=arr)
+            for info in ns_arr:
+                owner = info.get("kCGWindowOwnerName") or ""
+                if "Hearthstone" not in owner:
+                    continue
+                b = info.get("kCGWindowBounds")
+                if not b:
+                    continue
+                x, y, w, h = int(b["X"]), int(b["Y"]), int(b["Width"]), int(b["Height"])
+                if w > 100 and h > 100:
+                    log.info("CoreGraphics: HS window %dx%d at (%d,%d)", w, h, x, y)
+                    return (x, y, w, h)
+        except ImportError:
+            pass   # pyobjc not available; CoreGraphics array can't be iterated
     except Exception:
-        pass   # Quartz not installed — silent, fallback handles it
+        pass
     return None
 
 

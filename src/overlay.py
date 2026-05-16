@@ -52,51 +52,61 @@ def _apply_platform_flags(window: QMainWindow):
 
 def _macos_setup(window: QMainWindow):
     """
-    1. winId() returns an NSView*.  We must call .window() to get the NSWindow.
-    2. Set NSStatusWindowLevel (25) so we float above the game even when it
-       runs fullscreen.
-    3. NSWindowCollectionBehaviorCanJoinAllSpaces makes us appear in every
-       Mission Control Space, including Hearthstone's fullscreen Space.
-    4. setIgnoresMouseEvents_(True) is the correct macOS click-through API.
+    Configure the NSWindow using libobjc via ctypes — zero external dependencies.
+    libobjc.A.dylib ships with every macOS installation.
 
-    Requires:  pip install pyobjc-framework-AppKit
+    What we do:
+      1. winId() returns NSView* — call .window to get the NSWindow.
+      2. setLevel: 25  (NSStatusWindowLevel) → floats above fullscreen Metal apps.
+      3. setCollectionBehavior: CanJoinAllSpaces | FullScreenAuxiliary
+         → appears in Hearthstone's fullscreen Mission Control Space.
+      4. setIgnoresMouseEvents: YES  → true click-through, no focus stealing.
     """
+    import ctypes
+
     try:
-        import objc                                       # type: ignore[import]
-        from AppKit import (                              # type: ignore[import]
-            NSWindowCollectionBehaviorCanJoinAllSpaces,
-            NSWindowCollectionBehaviorFullScreenAuxiliary,
-        )
+        libobjc = ctypes.CDLL("/usr/lib/libobjc.A.dylib")
+    except OSError as exc:
+        log.warning("Cannot load libobjc.A.dylib: %s", exc)
+        return
 
-        # winId() is an NSView pointer — .window() gives us the NSWindow
-        ns_view   = objc.objc_object(c_void_p=int(window.winId()))
-        ns_window = ns_view.window()
+    libobjc.sel_registerName.restype  = ctypes.c_void_p
+    libobjc.sel_registerName.argtypes = [ctypes.c_char_p]
 
-        if ns_window is None:
-            log.warning("macOS: NSWindow is None — window not fully shown yet")
+    def _SEL(name: str):
+        return libobjc.sel_registerName(name.encode())
+
+    try:
+        # ── Step 1: NSView* → NSWindow* ──────────────────────────────────
+        libobjc.objc_msgSend.restype  = ctypes.c_void_p
+        libobjc.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        ns_window = libobjc.objc_msgSend(int(window.winId()), _SEL("window"))
+
+        if not ns_window:
+            log.warning("macOS: NSWindow not ready yet — platform flags will retry")
             return
 
-        # Float above the game (NSStatusWindowLevel = 25)
-        ns_window.setLevel_(25)
+        # ── Step 2: setLevel: NSStatusWindowLevel (25) ───────────────────
+        libobjc.objc_msgSend.restype  = None
+        libobjc.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                         ctypes.c_long]
+        libobjc.objc_msgSend(ns_window, _SEL("setLevel:"), 25)
 
-        # Join ALL spaces so we're visible in Hearthstone's fullscreen Space
-        ns_window.setCollectionBehavior_(
-            NSWindowCollectionBehaviorCanJoinAllSpaces
-            | NSWindowCollectionBehaviorFullScreenAuxiliary
-        )
+        # ── Step 3: setCollectionBehavior: CanJoinAllSpaces|FullScreenAuxiliary
+        libobjc.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                         ctypes.c_ulong]
+        libobjc.objc_msgSend(ns_window, _SEL("setCollectionBehavior:"),
+                             (1 << 2) | (1 << 7))
 
-        # True click-through: mouse events fall through to whatever is below
-        ns_window.setIgnoresMouseEvents_(True)
+        # ── Step 4: setIgnoresMouseEvents: YES ───────────────────────────
+        libobjc.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                         ctypes.c_bool]
+        libobjc.objc_msgSend(ns_window, _SEL("setIgnoresMouseEvents:"), True)
 
-        log.info("macOS overlay: level=25, joins all spaces, ignores mouse events")
+        log.info("macOS overlay: level=25, joins all spaces, click-through ✓")
 
-    except ImportError:
-        log.warning(
-            "pyobjc-framework-AppKit not installed — overlay may be hidden behind "
-            "the game on macOS.\n  Fix:  pip install pyobjc-framework-AppKit"
-        )
-    except Exception as e:
-        log.warning("macOS NSWindow setup failed: %s", e)
+    except Exception as exc:
+        log.warning("macOS NSWindow setup failed: %s", exc)
 
 
 # ── Canvas ────────────────────────────────────────────────────────────────────

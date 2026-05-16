@@ -3,8 +3,7 @@ mss>=9.0.1
 Pillow>=10.0.0
 opencv-python>=4.8.0
 pytesseract>=0.3.10
-pyobjc-framework-Quartz>=10.0; sys_platform == "darwin"
-pyobjc-framework-AppKit>=10.0; sys_platform == "darwin"
+# macOS window-level setup now uses ctypes + libobjc.A.dylib (no extra packages)
 watchdog>=3.0.0
 numpy>=1.24.0
 psutil>=5.9.0
